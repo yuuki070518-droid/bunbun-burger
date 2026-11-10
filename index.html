@@ -4,23 +4,23 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <style>html,body{margin:0;height:100%}body{font:14px system-ui,sans-serif}img{max-width:100%}[hidden]{display:none!important}</style>
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <script>
 /* BUN BUN BURGER — Claude の外（GitHub Pages など）で動かすときの通信部分。
-   PeerJS でブラウザ同士を直接つなぎ、ゲーム本体が使う「room」と同じ形の窓口を用意する。
-   ルームの最初の1人が中継役（ハブ）になり、全員の状態を配る。ハブが抜けたら残った人が引き継ぐ。 */
+   公開の MQTT ブローカー（WebSocket）経由で、同じルームの人どうしの状態をやりとりする。
+   ブラウザ同士を直接つなぐ方式（WebRTC）と違い、回線や設定でつながらないことがほとんどない。
+   ゲーム本体が使う「room」と同じ形の窓口を用意する。 */
 (function(){
   if(window.claude&&window.claude.use)return; // Claude の中で開いたときは何もしない
   const params=new URLSearchParams(location.search);
   let code=(params.get('room')||'').replace(/[^a-z0-9]/gi,'').slice(0,16).toLowerCase();
   if(!code){code=Math.random().toString(36).slice(2,8);params.set('room',code);history.replaceState(null,'',location.pathname+'?'+params.toString()+location.hash);}
   window.BUNBUN_ROOM=code;
-  const HUB='bunbun-burger-v1-'+code;
+  const BASE='bunbun-burger/v2/'+code+'/p/';
+  const BROKERS=window.BUNBUN_BROKERS||['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt'];
   const ME=Math.random().toString(36).slice(2,12);
-  const OPTS=Object.assign({debug:0},window.BUNBUN_PEER_OPTS||{});
-  const pres={},mine={},handlers={},cache={};
-  let peerObj=null,isHub=false,up=null,lastHeard=Date.now(),connected=false,stopped=false;
-  const conns={}; // hub: label -> {c,last}
+  const pres={},mine={},handlers={},cache={},seen={};
+  let client=null,connected=false,dirty=false,lastPub=0,stopped=false;
 
   const snap=ns=>Object.entries(pres[ns]||{}).map(([peer,p])=>Object.freeze({peer,by:null,isMe:peer===ME,sameTab:peer===ME,kind:'viewer',guest:false,presence:p,updatedAt:Date.now()}));
   function fire(ns,joined,left){cache[ns]=snap(ns);(handlers[ns]||[]).forEach(h=>{try{h({peers:cache[ns],joined:joined||[],left:left||[],updated:[]});}catch(e){console.error(e);}});}
@@ -30,74 +30,48 @@
     pres[ns][peer]=Object.freeze(p);fire(ns,was?[]:[{peer,presence:p}]);
   }
   function dropPeer(peer){Object.keys(pres).forEach(ns=>setP(ns,peer,null));}
-  function send(msg){
-    if(isHub){Object.values(conns).forEach(x=>{try{x.c.send(msg);}catch(e){}});}
-    else if(up&&up.open){try{up.send(msg);}catch(e){}}
-  }
-  function sendMine(){Object.keys(mine).forEach(ns=>send({t:'p',ns,peer:ME,p:mine[ns]}));}
 
-  // --- ハブ（中継役） ---
-  function becomeHub(p){
-    isHub=true;connected=true;peerObj=p;
-    p.on('connection',c=>{
-      let label=null;
-      c.on('open',()=>{try{c.send({t:'full',pres});}catch(e){}});
-      c.on('data',d=>{
-        if(!d||typeof d!=='object')return;
-        if(d.t==='p'&&typeof d.peer==='string'&&typeof d.ns==='string'){
-          if(!label){label=d.peer;conns[label]={c,last:Date.now()};}
-          if(conns[label])conns[label].last=Date.now();
-          setP(d.ns,d.peer,d.p);send(d);
-        }else if(d.t==='hb'&&label&&conns[label])conns[label].last=Date.now();
-      });
-      c.on('close',()=>{if(label&&conns[label]&&conns[label].c===c){delete conns[label];dropPeer(label);send({t:'bye',peer:label});}});
-    });
+  // 自分の状態をまとめて送る（最大で毎秒10回、変化がなくても4秒ごとに生存の合図）
+  function publish(){
+    if(!client||!connected)return;
+    try{client.publish(BASE+ME,JSON.stringify(mine),{qos:0,retain:true});}catch(e){}
+    lastPub=Date.now();dirty=false;
   }
-  // --- 参加者 ---
-  function joinHub(){
-    if(stopped)return;
-    const p=new Peer(OPTS);peerObj=p;
-    p.on('open',()=>{
-      const c=p.connect(HUB,{reliable:true});
-      c.on('open',()=>{up=c;connected=true;lastHeard=Date.now();sendMine();});
-      c.on('data',d=>{
-        lastHeard=Date.now();if(!d||typeof d!=='object')return;
-        if(d.t==='full'){Object.keys(d.pres||{}).forEach(ns=>Object.keys(d.pres[ns]).forEach(peer=>{if(peer!==ME)setP(ns,peer,d.pres[ns][peer]);}));}
-        else if(d.t==='p'&&d.peer!==ME)setP(d.ns,d.peer,d.p);
-        else if(d.t==='bye')dropPeer(d.peer);
-      });
-      c.on('close',()=>lost());
-    });
-    p.on('error',e=>{if(e.type==='peer-unavailable')lost();else if(!connected)setTimeout(lost,1500);});
-  }
-  // ハブが見つからない・いなくなったときは、自分がハブになれるか試す
-  function lost(){
-    if(stopped)return;
-    connected=false;up=null;isHub=false;
-    Object.keys(pres).forEach(ns=>Object.keys(pres[ns]).forEach(peer=>{if(peer!==ME)setP(ns,peer,null);}));
-    try{peerObj&&peerObj.destroy();}catch(e){}
-    setTimeout(start,300+Math.random()*1200);
-  }
-  function start(){
-    if(stopped)return;
-    if(typeof Peer==='undefined'){console.warn('PeerJS を読み込めませんでした');return;}
-    const p=new Peer(HUB,OPTS);let opened=false;
-    p.on('open',()=>{opened=true;becomeHub(p);});
-    p.on('error',e=>{if(!opened){try{p.destroy();}catch(_){} if(e.type==='unavailable-id')joinHub();else setTimeout(start,3000);}});
-    p.on('disconnected',()=>{if(opened&&!stopped){try{p.reconnect();}catch(_){}}});
-  }
-  // 生存確認：参加者は2秒ごとに合図、6秒聞こえない相手は切断扱い
   setInterval(()=>{
-    if(isHub){const now=Date.now();Object.entries(conns).forEach(([label,x])=>{if(now-x.last>8000){delete conns[label];try{x.c.close();}catch(e){}dropPeer(label);send({t:'bye',peer:label});}});send({t:'hb'});}
-    else if(up&&up.open){try{up.send({t:'hb'});}catch(e){} if(Date.now()-lastHeard>8000)lost();}
-  },2000);
-  window.addEventListener('pagehide',()=>{stopped=true;try{peerObj&&peerObj.destroy();}catch(e){}});
+    const now=Date.now();
+    if((dirty&&now-lastPub>=100)||now-lastPub>4000)publish();
+    for(const peer in seen){if(now-seen[peer]>15000){delete seen[peer];dropPeer(peer);}}
+  },50);
+
+  function onMsg(topic,buf){
+    const peer=topic.slice(BASE.length);if(!peer||peer===ME||peer.includes('/'))return;
+    const s=buf.toString();
+    if(!s){delete seen[peer];dropPeer(peer);return;}
+    let o;try{o=JSON.parse(s);}catch(e){return;}
+    if(!o||typeof o!=='object')return;
+    seen[peer]=Date.now();
+    Object.keys(o).forEach(ns=>{if(o[ns]&&typeof o[ns]==='object')setP(ns,peer,o[ns]);});
+    Object.keys(pres).forEach(ns=>{if(!(ns in o)&&pres[ns][peer])setP(ns,peer,null);});
+  }
+  function connect(i){
+    if(stopped)return;
+    if(typeof mqtt==='undefined'){console.warn('通信ライブラリを読み込めませんでした');return;}
+    const url=BROKERS[i%BROKERS.length];let ok=false;
+    const c=mqtt.connect(url,{clientId:'bb_'+ME+'_'+i,keepalive:10,connectTimeout:7000,reconnectPeriod:2000,clean:true,
+      will:{topic:BASE+ME,payload:'',qos:0,retain:true}});
+    client=c;
+    c.on('connect',()=>{ok=true;connected=true;c.subscribe(BASE+'+',{qos:0});publish();});
+    c.on('message',onMsg);
+    c.on('close',()=>{connected=false;});
+    setTimeout(()=>{if(!ok&&!stopped){try{c.end(true);}catch(e){}connect(i+1);}},9000);
+  }
+  window.addEventListener('pagehide',()=>{stopped=true;try{client.publish(BASE+ME,'',{qos:0,retain:true});client.end();}catch(e){}});
 
   function api(ns){
     pres[ns]=pres[ns]||{};
     return {
       presence(patch){mine[ns]=Object.assign({},mine[ns]||{});for(const k in patch){if(patch[k]===null)delete mine[ns][k];else mine[ns][k]=patch[k];}
-        setP(ns,ME,Object.assign({},mine[ns]));send({t:'p',ns,peer:ME,p:mine[ns]});return Promise.resolve();},
+        setP(ns,ME,Object.assign({},mine[ns]));dirty=true;return Promise.resolve();},
       peers(){return cache[ns]||(cache[ns]=snap(ns));},
       onPeers(h){(handlers[ns]=handlers[ns]||[]).push(h);setTimeout(()=>h({peers:snap(ns),joined:snap(ns),left:[],updated:[]}),0);return()=>{handlers[ns]=handlers[ns].filter(x=>x!==h);};},
       join(name){return Promise.resolve(api(ns+'/'+name));},
@@ -107,7 +81,7 @@
   }
   const lobby=api('lobby');setP('lobby',ME,{});
   window.claude={use:n=>Promise.resolve(n==='room'?lobby:null)};
-  start();
+  connect(0);
 })();
 
 </script>
@@ -1825,6 +1799,7 @@ function tickAvatars(dt){
 function updateMPStatus(){
   const el=$('#mpStatus');
   if(!MP.room){el.textContent='オンラインに接続できないため、ひとりで営業します。一緒に遊ぶには、Claudeにログインした状態で、共有から招待されたアカウントで開く必要があります（公開リンクやログインなしでは接続できません）。';return;}
+  if(window.BUNBUN_ROOM&&MP.room.connected&&!MP.room.connected()){el.textContent='オンラインに接続しています…（数秒かかることがあります）';return;}
   const ps=MP.room.peers().filter(p=>p.kind==='viewer'&&p.presence&&p.presence.pl);
   const hostP=ps.find(p=>p.peer===MP.host),hn=hostP?String(hostP.presence.n||'スタッフ'):'';
   el.textContent=ps.length<=1?'オンライン：あなただけ。招待した人が同じページを開くと一緒に働けます。':`オンライン ${ps.length}人 ・ 店長：${isHost()?'あなた':hn}`;
@@ -1873,6 +1848,7 @@ if(window.BUNBUN_ROOM){
 }
 // タブが裏にあっても同期を止めない（描画が止まっても状態の送受信は続ける）
 setInterval(()=>{if(document.hidden)mpTick(.25);},250);
+setInterval(()=>{if(MP.room)updateMPStatus();},1000);
 
 /* ---------- 設定画面 ---------- */
 function applyCfg(){

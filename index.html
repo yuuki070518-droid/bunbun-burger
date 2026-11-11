@@ -8,7 +8,8 @@
 <script>
 /* BUN BUN BURGER — Claude の外（GitHub Pages など）で動かすときの通信部分。
    公開の MQTT ブローカー（WebSocket）経由で、同じルームの人どうしの状態をやりとりする。
-   ブラウザ同士を直接つなぐ方式（WebRTC）と違い、回線や設定でつながらないことがほとんどない。
+   軽量化のため、状態は「項目ごと」に別々に送り、変わった項目だけを送る。
+   （例：位置だけ動いたときは位置の数バイトだけ。店の状態全体は送り直さない）
    ゲーム本体が使う「room」と同じ形の窓口を用意する。 */
 (function(){
   if(window.claude&&window.claude.use)return; // Claude の中で開いたときは何もしない
@@ -16,11 +17,13 @@
   let code=(params.get('room')||'').replace(/[^a-z0-9]/gi,'').slice(0,16).toLowerCase();
   if(!code){code=Math.random().toString(36).slice(2,8);params.set('room',code);history.replaceState(null,'',location.pathname+'?'+params.toString()+location.hash);}
   window.BUNBUN_ROOM=code;
-  const BASE='bunbun-burger/v2/'+code+'/p/';
+  const BASE='bunbun-burger/v3/'+code+'/';
   const BROKERS=window.BUNBUN_BROKERS||['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt'];
   const ME=Math.random().toString(36).slice(2,12);
-  const pres={},mine={},handlers={},cache={},seen={};
-  let client=null,connected=false,dirty=false,lastPub=0,stopped=false;
+  const esc=ns=>ns.replace(/\//g,'~'),unesc=ns=>ns.replace(/~/g,'/');
+  const pres={},mine={},handlers={},cache={},seen={},alive={},data={},sent={};
+  const dirty=new Set();
+  let client=null,connected=false,lastPub=0,lastBeat=0,stopped=false;
 
   const snap=ns=>Object.entries(pres[ns]||{}).map(([peer,p])=>Object.freeze({peer,by:null,isMe:peer===ME,sameTab:peer===ME,kind:'viewer',guest:false,presence:p,updatedAt:Date.now()}));
   function fire(ns,joined,left){cache[ns]=snap(ns);(handlers[ns]||[]).forEach(h=>{try{h({peers:cache[ns],joined:joined||[],left:left||[],updated:[]});}catch(e){console.error(e);}});}
@@ -29,54 +32,72 @@
     if(p==null){if(was){const old=pres[ns][peer];delete pres[ns][peer];fire(ns,[],[{peer,presence:old}]);}return;}
     pres[ns][peer]=Object.freeze(p);fire(ns,was?[]:[{peer,presence:p}]);
   }
-  function dropPeer(peer){Object.keys(pres).forEach(ns=>setP(ns,peer,null));}
+  function dropPeer(peer){delete alive[peer];delete seen[peer];delete data[peer];Object.keys(pres).forEach(ns=>setP(ns,peer,null));}
+  function showPeer(peer,ns){const d=data[peer]&&data[peer][ns];if(!d)return;setP(ns,peer,Object.assign({},d));}
 
-  // 自分の状態をまとめて送る（最大で毎秒20回、変化がなくても4秒ごとに生存の合図）
+  // 送信：変わった項目だけ（最短50ms間隔）。生存の合図は4秒ごと
   function publish(){
     if(!client||!connected)return;
-    try{client.publish(BASE+ME,JSON.stringify(mine),{qos:0,retain:true});}catch(e){}
-    lastPub=Date.now();dirty=false;
+    const now=Date.now();
+    dirty.forEach(id=>{
+      const [ns,key]=id.split('\n');const v=mine[ns]&&mine[ns][key];
+      const str=v===undefined?'':JSON.stringify(v);
+      if(sent[id]===str)return;sent[id]=str;
+      try{client.publish(BASE+ME+'/k/'+esc(ns)+'/'+key,str,{qos:0,retain:true});}catch(e){}
+    });
+    dirty.clear();lastPub=now;
   }
+  function beat(){if(client&&connected){try{client.publish(BASE+ME+'/a',String(Date.now()),{qos:0,retain:true});}catch(e){}lastBeat=Date.now();}}
   setInterval(()=>{
     const now=Date.now();
-    if((dirty&&now-lastPub>=50)||now-lastPub>4000)publish();
-    for(const peer in seen){if(now-seen[peer]>15000){delete seen[peer];dropPeer(peer);}}
+    if(dirty.size&&now-lastPub>=50)publish();
+    if(now-lastBeat>4000)beat();
+    for(const peer in seen){if(now-seen[peer]>15000)dropPeer(peer);}
   },20);
 
   function onMsg(topic,buf){
-    const peer=topic.slice(BASE.length);if(!peer||peer===ME||peer.includes('/'))return;
+    const parts=topic.slice(BASE.length).split('/');const peer=parts[0];if(!peer||peer===ME)return;
     const s=buf.toString();
-    if(!s){delete seen[peer];dropPeer(peer);return;}
-    let o;try{o=JSON.parse(s);}catch(e){return;}
-    if(!o||typeof o!=='object')return;
-    seen[peer]=Date.now();
-    Object.keys(o).forEach(ns=>{if(o[ns]&&typeof o[ns]==='object')setP(ns,peer,o[ns]);});
-    Object.keys(pres).forEach(ns=>{if(!(ns in o)&&pres[ns][peer])setP(ns,peer,null);});
+    if(parts[1]==='a'){
+      if(!s){dropPeer(peer);return;}
+      seen[peer]=Date.now();
+      if(!alive[peer]){alive[peer]=true;Object.keys(data[peer]||{}).forEach(ns=>showPeer(peer,ns));}
+      return;
+    }
+    if(parts[1]!=='k'||parts.length<4)return;
+    const ns=unesc(parts[2]),key=parts[3];
+    let v;if(s){try{v=JSON.parse(s);}catch(e){return;}}
+    const d=((data[peer]=data[peer]||{})[ns]=data[peer][ns]||{});
+    if(v===undefined)delete d[key];else d[key]=v;
+    if(alive[peer]){seen[peer]=Date.now();showPeer(peer,ns);}
   }
   function connect(i){
     if(stopped)return;
     if(typeof mqtt==='undefined'){console.warn('通信ライブラリを読み込めませんでした');return;}
     const url=BROKERS[i%BROKERS.length];let ok=false;
     const c=mqtt.connect(url,{clientId:'bb_'+ME+'_'+i,keepalive:10,connectTimeout:7000,reconnectPeriod:2000,clean:true,
-      will:{topic:BASE+ME,payload:'',qos:0,retain:true}});
+      will:{topic:BASE+ME+'/a',payload:'',qos:0,retain:true}});
     client=c;
-    c.on('connect',()=>{ok=true;connected=true;c.subscribe(BASE+'+',{qos:0});publish();});
+    c.on('connect',()=>{ok=true;connected=true;c.subscribe(BASE+'#',{qos:0});
+      for(const k in sent)delete sent[k];Object.keys(mine).forEach(ns=>Object.keys(mine[ns]).forEach(key=>dirty.add(ns+'\n'+key)));publish();beat();});
     c.on('message',onMsg);
     c.on('close',()=>{connected=false;});
     setTimeout(()=>{if(!ok&&!stopped){try{c.end(true);}catch(e){}connect(i+1);}},9000);
   }
-  window.addEventListener('pagehide',()=>{stopped=true;try{client.publish(BASE+ME,'',{qos:0,retain:true});client.end();}catch(e){}});
+  window.addEventListener('pagehide',()=>{stopped=true;try{
+    Object.keys(sent).forEach(id=>{const [ns,key]=id.split('\n');client.publish(BASE+ME+'/k/'+esc(ns)+'/'+key,'',{qos:0,retain:true});});
+    client.publish(BASE+ME+'/a','',{qos:0,retain:true});client.end();}catch(e){}});
 
   function api(ns){
     pres[ns]=pres[ns]||{};
     return {
-      presence(patch){mine[ns]=Object.assign({},mine[ns]||{});for(const k in patch){if(patch[k]===null)delete mine[ns][k];else mine[ns][k]=patch[k];}
-        setP(ns,ME,Object.assign({},mine[ns]));dirty=true;return Promise.resolve();},
+      presence(patch){mine[ns]=Object.assign({},mine[ns]||{});for(const k in patch){if(patch[k]===null)delete mine[ns][k];else mine[ns][k]=patch[k];dirty.add(ns+'\n'+k);}
+        setP(ns,ME,Object.assign({},mine[ns]));return Promise.resolve();},
       peers(){return cache[ns]||(cache[ns]=snap(ns));},
       onPeers(h){(handlers[ns]=handlers[ns]||[]).push(h);setTimeout(()=>h({peers:snap(ns),joined:snap(ns),left:[],updated:[]}),0);return()=>{handlers[ns]=handlers[ns].filter(x=>x!==h);};},
       join(name){return Promise.resolve(api(ns+'/'+name));},
       connected(){return connected;},
-      flush(){if(Date.now()-lastPub>=30)publish();else dirty=true;},
+      flush(){if(Date.now()-lastPub>=30)publish();},
       emit(){return Promise.resolve();},on(){return()=>{};}
     };
   }
@@ -487,11 +508,11 @@ scene.add(camera);
 function resize(){const w=window.innerWidth,h=window.innerHeight;renderer.setSize(w,h,false);camera.aspect=w/h;camera.updateProjectionMatrix();}
 window.addEventListener('resize',resize);resize();
 
-scene.add(new THREE.HemisphereLight(0xfff1dc,0x3a2a22,.62));
-renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+scene.add(new THREE.HemisphereLight(0xfff1dc,0x3a2a22,.72));
+renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFShadowMap;renderer.shadowMap.autoUpdate=false;let shadowN=0;
 const sun=new THREE.DirectionalLight(0xfff4e6,.55);sun.position.set(2.5,10,1);sun.target.position.set(0,0,-2.75);scene.add(sun);scene.add(sun.target);
 sun.castShadow=true;sun.shadow.mapSize.set(2048,2048);Object.assign(sun.shadow.camera,{left:-8.5,right:8.5,top:6,bottom:-6,near:1,far:20});sun.shadow.camera.updateProjectionMatrix();sun.shadow.bias=-.0004;sun.shadow.normalBias=.015;
-[[-5,-3],[0,-3],[5,-3],[-3,4],[3,4]].forEach(([x,z])=>{const p=new THREE.PointLight(0xffdfae,.3,10);p.position.set(x,2.9,z);scene.add(p);box(.9,.04,.9,new THREE.MeshBasicMaterial({color:0xfff0d0}),x,3.13,z);});
+[[-5,-3],[0,-3],[5,-3],[-3,4],[3,4]].forEach(([x,z],i)=>{if(i===0||i===2||i===4){const p=new THREE.PointLight(0xffdfae,.42,13);p.position.set(i===4?0:x*.75,2.9,z);scene.add(p);}box(.9,.04,.9,new THREE.MeshBasicMaterial({color:0xfff0d0}),x,3.13,z);});
 
 const matCache={};
 const M=c=>matCache[c]||(matCache[c]=new THREE.MeshStandardMaterial({color:c,roughness:.75,metalness:0}));
@@ -1014,7 +1035,7 @@ SLOT_X.forEach((x,i)=>{
   box(.6,.012,.42,TRAY,0,.006,0,t);box(.6,.022,.015,TRAY,0,.011,.205,t);box(.6,.022,.015,TRAY,0,.011,-.205,t);box(.015,.022,.42,TRAY,.3,.011,0,t);box(.015,.022,.42,TRAY,-.3,.011,0,t);
   box(.5,.002,.34,LINER,0,.0135,0,t);
   part.glow=box(.62,.012,.1,GLOW,x,2.24,0);
-  const pl=new THREE.PointLight(0xff9a40,.22,1.5);pl.position.set(x,2.0,0);scene.add(pl);part.pl=pl;
+  part.pl={intensity:0};
   const g=new THREE.Group();g.position.set(x,1.075,0);scene.add(g);slotGroups.push(g);
   const sign=new THREE.Group();sign.position.set(x,2.0,0);scene.add(sign);
   const pole=cylM(.01,.01,.12,STEEL);pole.position.y=.2;sign.add(pole);
@@ -1860,9 +1881,9 @@ function pump(){
   let n=0;while(simAcc>=TICK&&n<1800){simStep(TICK);simAcc-=TICK;n++;}
 }
 setInterval(pump,250); // 裏タブで描画が止まっても進行は続ける
-let last=performance.now(),fpsN=0,fpsT=0,loopT=0;
+let last=performance.now(),fpsN=0,fpsT=0,loopT=0;const autoQ={low:0,done:false};
 function loop(now){
-  const dt=Math.min(.05,Math.max(0,(now-last)/1000));last=now;
+  const rawDt=Math.min(1,Math.max(0,(now-last)/1000)),dt=Math.min(.05,rawDt);last=now;
   pump();
   if(running())movePlayer(dt);
   if((tick+=dt)>.2){tick=0;if(active()){drawRail();drawStats();}}
@@ -1871,8 +1892,11 @@ function loop(now){
   if(active()){updateHover();drawStations(now,dt);}
   $('#relock').hidden=!(active()&&!uiOpen&&!locked&&!fallback);
   if((loopT+=dt)>.1){loopT=0;updateLoops();}
-  mpTick(dt);
-  fpsN++;fpsT+=dt;if(fpsT>=.5){if(CFG.fps)$('#fps').textContent=`${Math.round(fpsN/fpsT)} FPS`;fpsN=0;fpsT=0;}
+  mpTick(rawDt); // 通信の間隔は実時間で数える（描画が遅い端末でも送信間隔が延びないように）
+  fpsN++;fpsT+=dt;if(fpsT>=.5){const f=fpsN/fpsT;if(CFG.fps)$('#fps').textContent=`${Math.round(f)} FPS`;fpsN=0;fpsT=0;
+    if(active()&&!document.hidden&&!autoQ.done){autoQ.low=f<38?autoQ.low+1:0;if(autoQ.low>=8){autoQ.done=true;
+      if(CFG.shadows||CFG.scale>.75){CFG.shadows=false;CFG.scale=Math.min(CFG.scale,.75);saveCfg();applyCfg();showToast('動きが重いので画質を自動で下げました（影オフ・解像度75%）。設定で戻せます');}}}}
+  if((shadowN++)%3===0)renderer.shadowMap.needsUpdate=true;
   renderer.render(scene,camera);
   requestAnimationFrame(loop);
 }
@@ -2149,9 +2173,9 @@ function clientPull(){
 }
 function mpTick(dt){
   if(!MP.room)return;
-  if(isHost()){if(hostReadActs())publishHost(true);else if((MP.pubT+=dt)>=.1)publishHost();}
+  if(isHost()){if(hostReadActs())publishHost(true);}
   else{clientPull();tickClientCustomers(dt);}
-  if((MP.posT+=dt)>=.066){MP.posT=0;const pos=active()?[Math.round(P.x*100),Math.round(P.z*100),Math.round(yaw*100)]:[0,0,0];const sig=pos.join()+active();
+  if((MP.posT+=dt)>=.08){MP.posT=0;const pos=active()?[Math.round(P.x*100),Math.round(P.z*100),Math.round(yaw*100)]:[0,0,0];const sig=pos.join()+active();
     if(sig!==MP.lastPos){MP.lastPos=sig;MP.room.presence(active()?{x:pos[0],z:pos[1],r:pos[2]}:{x:null,z:null,r:null}).catch(()=>{});}}
   tickAvatars(dt);
 }
@@ -2182,13 +2206,15 @@ if(window.BUNBUN_ROOM){
 }
 // タブが裏にあっても同期を止めない（描画が止まっても状態の送受信は続ける）
 setInterval(()=>{if(document.hidden)mpTick(.25);},250);
+// 店長の状態配信は描画とは別のタイマーで一定間隔（約7回/秒）。描画が重い端末でも配信が遅れない
+setInterval(()=>{if(MP.room&&MP.me&&isHost()){hostReadActs();publishHost();}},150);
 setInterval(()=>{if(MP.room)updateMPStatus();},1000);
 
 /* ---------- 設定画面 ---------- */
 function applyCfg(){
   camera.fov=CFG.fov;
   sun.castShadow=CFG.shadows;
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,2)*CFG.scale);resize();
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,1.5)*CFG.scale);resize();
   $('#fps').hidden=!CFG.fps;
   drawBinLabels();drawStats();
 }

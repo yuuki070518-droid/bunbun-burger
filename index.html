@@ -6,7 +6,7 @@
 <style>html,body{margin:0;height:100%}body{font:14px system-ui,sans-serif}img{max-width:100%}[hidden]{display:none!important}</style>
 <script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <script>
-/* BUN BUN BURGER — Claude の外（GitHub Pages など）で動かすときの通信部分。
+/* MAS BURGER — Claude の外（GitHub Pages など）で動かすときの通信部分。
    公開の MQTT ブローカー（WebSocket）経由で、同じルームの人どうしの状態をやりとりする。
    軽量化のため、状態は「項目ごと」に別々に送り、変わった項目だけを送る。
    （例：位置だけ動いたときは位置の数バイトだけ。店の状態全体は送り直さない）
@@ -18,7 +18,11 @@
   if(!code){code=Math.random().toString(36).slice(2,8);params.set('room',code);history.replaceState(null,'',location.pathname+'?'+params.toString()+location.hash);}
   window.BUNBUN_ROOM=code;
   const BASE='bunbun-burger/v3/'+code+'/';
-  const BROKERS=window.BUNBUN_BROKERS||['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt'];
+  // 自前のサーバーから配信されているとき（GitHub Pages 以外の http/https）は、そのサーバーの /mqtt で中継する
+  const SELF=/^https?:$/.test(location.protocol)&&!/github\.io$/.test(location.hostname);
+  const OWN=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/mqtt';
+  const BROKERS=window.BUNBUN_BROKERS||(SELF?[OWN]:['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt']);
+  window.BUNBUN_NET=SELF?'自前サーバー':'公開サーバー';
   const ME=Math.random().toString(36).slice(2,12);
   const esc=ns=>ns.replace(/\//g,'~'),unesc=ns=>ns.replace(/~/g,'/');
   const pres={},mine={},handlers={},cache={},seen={},alive={},data={},sent={};
@@ -109,7 +113,7 @@
 </script>
 </head>
 <body>
-<title>バーガー屋シミュレーター</title>
+<title>MAS BURGER</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Dela+Gothic+One&family=M+PLUS+1p:wght@400;700;800&display=swap">
@@ -264,7 +268,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 
 <div class="overlay" id="title">
   <div class="card">
-    <div class="logo">BUN BUN<br>BURGER</div>
+    <div class="logo">MAS<br>BURGER</div>
     <p class="sub">あなたは小さなハンバーガー屋の店長。パティを焼き、注文チケット通りに具材を重ね、ポテトとドリンクを添えて受け渡し口へ。会計はセルフレジにおまかせです。</p>
     <div class="steps">
       <div class="step"><b>1 焼く</b>冷蔵庫からパティを取り、グリルへ。緑の印が出たら焼き上がり。赤は焦げ。</div>
@@ -579,10 +583,10 @@ const WIRE=new THREE.MeshStandardMaterial({color:0xcfd4d8,map:wireTex,alphaTest:
 // 包み紙・トレイ敷紙
 const PAPER=new THREE.MeshStandardMaterial({color:0xf3efe4,roughness:.85});
 const wrapTex=canvasTex(256,256,(c,w,h)=>{c.fillStyle='#f4efe2';c.fillRect(0,0,w,h);c.fillStyle='rgba(214,59,43,.35)';c.font=`800 15px ${FONT}`;c.textAlign='center';
-  for(let y=0;y<9;y++)for(let x=0;x<5;x++)c.fillText('BUN BUN',(x+(y%2)*.5)*58+10,y*30+20);}).tex;
+  for(let y=0;y<9;y++)for(let x=0;x<5;x++)c.fillText('MAS',(x+(y%2)*.5)*58+10,y*30+20);}).tex;
 const linerTex=canvasTex(256,180,(c,w,h)=>{c.fillStyle='#fbf6ea';c.fillRect(0,0,w,h);c.fillStyle='#d63b2b';
   for(let x=0;x<w;x+=16)for(let y=0;y<h;y+=16)if(((x+y)/16)%2===0)c.fillRect(x,y,16,16);
-  c.fillStyle='#fbf6ea';roundRect(c,30,30,w-60,h-60,16);c.fill();c.fillStyle='#d63b2b';c.font=`${h*.16}px ${DFONT}`;c.textAlign='center';c.textBaseline='middle';c.fillText('BUN BUN',w/2,h*.44);c.font=`700 ${h*.08}px ${FONT}`;c.fillText('いつもありがとう',w/2,h*.62);}).tex;
+  c.fillStyle='#fbf6ea';roundRect(c,30,30,w-60,h-60,16);c.fill();c.fillStyle='#d63b2b';c.font=`${h*.16}px ${DFONT}`;c.textAlign='center';c.textBaseline='middle';c.fillText('MAS BURGER',w/2,h*.44);c.font=`700 ${h*.08}px ${FONT}`;c.fillText('いつもありがとう',w/2,h*.62);}).tex;
 
 // パティ
 const pattyTex=canvasTex(256,256,(c,w,h)=>{c.fillStyle='#c4c4c4';c.fillRect(0,0,w,h);
@@ -702,7 +706,7 @@ const fryGeo=new THREE.BoxGeometry(.0095,1,.0095);
 const FRY_OK=['#f2c14e','#e9b03c','#f6d36a','#dca236'].map(c=>new THREE.MeshStandardMaterial({color:c,roughness:.55}));
 const FRY_BURNT=['#5a3712','#3d240c'].map(c=>new THREE.MeshStandardMaterial({color:c,roughness:.7}));
 const cartonTex=canvasTex(512,128,(c,w,h)=>{c.fillStyle='#c8281c';c.fillRect(0,0,w,h);c.fillStyle='#f2b134';c.fillRect(0,0,w,10);
-  c.fillStyle='#fbf1dc';c.font=`${h*.22}px ${DFONT}`;c.textAlign='center';c.textBaseline='middle';for(let i=0;i<4;i++)c.fillText('BUN BUN',w*(i+.5)/4,h*.55);}).tex;
+  c.fillStyle='#fbf1dc';c.font=`${h*.22}px ${DFONT}`;c.textAlign='center';c.textBaseline='middle';for(let i=0;i<4;i++)c.fillText('MAS',w*(i+.5)/4,h*.55);}).tex;
 const cartonMat=new THREE.MeshStandardMaterial({map:cartonTex,roughness:.6,side:THREE.DoubleSide});
 const cartonGeo=new THREE.CylinderGeometry(.068,.045,.105,4,1,true);cartonGeo.rotateY(Math.PI/4);
 function friesMesh(burnt){
@@ -768,7 +772,7 @@ function itemMesh(it){
     case 'potato':return shade(mk(new THREE.BoxGeometry(.2,.05,.28),bagMat));
     case 'nugget':return shade(mk(new THREE.BoxGeometry(.2,.05,.28),nugBagMat));
     case 'bottle':return bottleMesh(it.sauce);
-    case 'tbag':{const g=new THREE.Group();box(.2,.24,.13,BAG_M,0,.12,0,g);box(.2,.04,.13,BAG_M2,0,.25,0,g);const lb=label(.12,.05,96,(c,w,h)=>{c.fillStyle='#d63b2b';c.font=`${h*.7}px ${DFONT}`;c.textAlign='center';c.textBaseline='middle';c.fillText('BUN BUN',w/2,h*.55);});lb.position.set(0,.14,.066);g.add(lb);g.userData.cnt=it.items.length;return shade(g);}
+    case 'tbag':{const g=new THREE.Group();box(.2,.24,.13,BAG_M,0,.12,0,g);box(.2,.04,.13,BAG_M2,0,.25,0,g);const lb=label(.12,.05,96,(c,w,h)=>{c.fillStyle='#d63b2b';c.font=`${h*.7}px ${DFONT}`;c.textAlign='center';c.textBaseline='middle';c.fillText('MAS',w/2,h*.55);});lb.position.set(0,.14,.066);g.add(lb);g.userData.cnt=it.items.length;return shade(g);}
     case 'tray':{const g=new THREE.Group();box(.4,.012,.3,TRAY,0,.006,0,g);box(.4,.02,.012,TRAY,0,.012,.145,g);box(.4,.02,.012,TRAY,0,.012,-.145,g);box(.012,.02,.3,TRAY,.2,.012,0,g);box(.012,.02,.3,TRAY,-.2,.012,0,g);box(.34,.002,.25,LINER,0,.013,0,g);
       it.items.forEach((x,j)=>{const m=x.type==='burger'?wrappedMesh(x.layers):itemMesh(x);if(!m)return;m.scale.multiplyScalar(.75);m.position.set(((j%3)-1)*.12,.014,(j<3?-.06:.07));g.add(m);});return shade(g);}
     case 'stack':{const st=buildStack(it.layers);if(!it.paper)return st;const g=new THREE.Group();box(.3,.002,.3,WRAP,0,.001,0,g);st.position.y=.002;g.add(st);return shade(g);}
@@ -795,7 +799,7 @@ box(7.3,1.2,.21,'#d63b2b',-4.45,.6,8.35);box(7.3,1.2,.21,'#d63b2b',4.45,.6,8.35)
 // 扉のガラス
 const glass=new THREE.Mesh(new THREE.PlaneGeometry(1.6,2.4),new THREE.MeshBasicMaterial({color:0x7fa6b8,transparent:true,opacity:.35}));glass.position.set(0,1.2,8.3);glass.rotation.y=Math.PI;scene.add(glass);
 // 看板
-const logo=label(3.6,.9,720,(c,w,h)=>{c.fillStyle='#d63b2b';roundRect(c,0,0,w,h,24);c.fill();c.fillStyle='#f2b134';c.font=`${h*.46}px ${DFONT}`;c.textAlign='center';c.textBaseline='middle';const tw=c.measureText('BUN BUN BURGER').width;if(tw>w*.88)c.font=`${h*.46*w*.88/tw}px ${DFONT}`;c.fillText('BUN BUN BURGER',w/2,h*.54);});
+const logo=label(3.6,.9,720,(c,w,h)=>{c.fillStyle='#d63b2b';roundRect(c,0,0,w,h,24);c.fill();c.fillStyle='#f2b134';c.font=`${h*.46}px ${DFONT}`;c.textAlign='center';c.textBaseline='middle';const tw=c.measureText('MAS BURGER').width;if(tw>w*.88)c.font=`${h*.46*w*.88/tw}px ${DFONT}`;c.fillText('MAS BURGER',w/2,h*.54);});
 logo.position.set(0,2.55,-6.12);scene.add(logo);
 // 客席
 function table(x,z){box(1,.05,1,'#f2b134',x,.75,z);const l=cylM(.05,.05,.75,'#3a2e27');l.position.set(x,.375,z);scene.add(l);
@@ -1881,8 +1885,9 @@ function pump(){
   let n=0;while(simAcc>=TICK&&n<1800){simStep(TICK);simAcc-=TICK;n++;}
 }
 setInterval(pump,250); // 裏タブで描画が止まっても進行は続ける
-let last=performance.now(),fpsN=0,fpsT=0,loopT=0;const autoQ={low:0,done:false};
+let last=performance.now(),fpsN=0,fpsT=0,loopT=0;const autoQ={low:0,done:false};let workMs=0;
 function loop(now){
+  const w0=performance.now();
   const rawDt=Math.min(1,Math.max(0,(now-last)/1000)),dt=Math.min(.05,rawDt);last=now;
   pump();
   if(running())movePlayer(dt);
@@ -1893,11 +1898,12 @@ function loop(now){
   $('#relock').hidden=!(active()&&!uiOpen&&!locked&&!fallback);
   if((loopT+=dt)>.1){loopT=0;updateLoops();}
   mpTick(rawDt); // 通信の間隔は実時間で数える（描画が遅い端末でも送信間隔が延びないように）
-  fpsN++;fpsT+=dt;if(fpsT>=.5){const f=fpsN/fpsT;if(CFG.fps)$('#fps').textContent=`${Math.round(f)} FPS`;fpsN=0;fpsT=0;
-    if(active()&&!document.hidden&&!autoQ.done){autoQ.low=f<38?autoQ.low+1:0;if(autoQ.low>=8){autoQ.done=true;
+  fpsN++;fpsT+=rawDt;if(fpsT>=.5){const f=fpsN/fpsT,wk=workMs/fpsN;if(CFG.fps)$('#fps').textContent=`${Math.round(f)} FPS ・ 処理 ${wk.toFixed(1)}ms/回`;fpsN=0;fpsT=0;workMs=0;
+    if(active()&&!document.hidden&&!autoQ.done){autoQ.low=f<38&&wk>12?autoQ.low+1:0;if(autoQ.low>=8){autoQ.done=true;
       if(CFG.shadows||CFG.scale>.75){CFG.shadows=false;CFG.scale=Math.min(CFG.scale,.75);saveCfg();applyCfg();showToast('動きが重いので画質を自動で下げました（影オフ・解像度75%）。設定で戻せます');}}}}
   if((shadowN++)%3===0)renderer.shadowMap.needsUpdate=true;
   renderer.render(scene,camera);
+  workMs+=performance.now()-w0;
   requestAnimationFrame(loop);
 }
 
@@ -2159,6 +2165,7 @@ function updateMPStatus(){
   const ps=MP.room.peers().filter(p=>p.kind==='viewer'&&p.presence&&p.presence.pl);
   const hostP=ps.find(p=>p.peer===MP.host),hn=hostP?String(hostP.presence.n||'スタッフ'):'';
   el.textContent=ps.length<=1?'オンライン：あなただけ。招待した人が同じページを開くと一緒に働けます。':`オンライン ${ps.length}人 ・ 店長：${isHost()?'あなた':hn}`;
+  if(window.BUNBUN_NET)el.textContent+=`（通信：${window.BUNBUN_NET}）`;
   if(phase==='title')$('#btnStart').textContent=isClient()?`開店を店長に依頼（DAY ${S.day}）`:`開店する（DAY ${S.day}）`;
   const box=$('#players');
   box.innerHTML=ps.length>1?ps.map(p=>`<div class="pl"><i style="background:${peerColor(p.peer)}"></i><span></span>${p.peer===MP.host?'<small>店長</small>':''}</div>`).join(''):'';
